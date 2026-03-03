@@ -1,0 +1,16 @@
+anthropic>=0.49.0
+fastapi>=0.116.0
+langchain-openai>=0.3.12
+langgraph>=0.5.3
+openai>=1.99.0
+playwright>=1.55.0
+pydantic-settings>=2.10.1
+python-dotenv>=1.1.1
+python-multipart>=0.0.20
+uvicorn[standard]>=0.35.0
+browser-use>=0.3.3
+
+[dev]
+pytest>=8.4.1
+pytest-asyncio>=1.1.0
+httpx>=0.28.1

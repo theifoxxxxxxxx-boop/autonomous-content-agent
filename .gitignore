@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+.next/
+out/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Runtime artifacts
+backend/uploads/
+*.log

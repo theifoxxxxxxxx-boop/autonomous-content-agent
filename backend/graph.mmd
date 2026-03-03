@@ -1,0 +1,25 @@
+﻿---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	node_a_vision(node_a_vision)
+	node_b_copy(node_b_copy)
+	node_c_review(node_c_review)
+	node_d_browser(node_d_browser)
+	node_e_notify(node_e_notify)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> node_a_vision;
+	node_a_vision --> node_b_copy;
+	node_b_copy --> node_c_review;
+	node_c_review -. &nbsp;to_rewrite&nbsp; .-> node_b_copy;
+	node_c_review -. &nbsp;to_browser&nbsp; .-> node_d_browser;
+	node_c_review -. &nbsp;to_notify&nbsp; .-> node_e_notify;
+	node_d_browser --> node_e_notify;
+	node_e_notify --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+
