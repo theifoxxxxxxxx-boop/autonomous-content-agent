@@ -7,7 +7,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable
 
 from playwright.async_api import (
     BrowserContext,
@@ -325,12 +325,18 @@ class BrowserOperator:
                 profile_args=profile_args,
             )
             page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(adapter.creator_center_url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2_000)
+            step_timeout = self._step_timeout_seconds(self.settings.browser_operation_timeout_sec or 240)
+            await self._await_with_timeout(
+                page.goto(adapter.creator_center_url, wait_until="domcontentloaded"),
+                timeout_sec=step_timeout,
+                step_name="opening creator center",
+            )
+            await page.wait_for_timeout(1_200)
 
-            if await self._need_login_robust(page):
-                login_wait_timeout = min(max(int(self.settings.browser_operation_timeout_sec or 240), 60), 300)
-                page_after_login = await self._wait_for_manual_login(context, timeout_sec=login_wait_timeout)
+            if await self._need_login_robust_visible(page):
+                total_timeout = int(self.settings.browser_operation_timeout_sec or 240)
+                login_wait_timeout = min(max(total_timeout // 2, 45), 120)
+                page_after_login = await self._wait_for_manual_login_robust(context, timeout_sec=login_wait_timeout)
                 if page_after_login is None:
                     keep_session_open = True
                     if context is not None and playwright is not None:
@@ -347,14 +353,24 @@ class BrowserOperator:
                         note=login_note,
                     )
                 page = page_after_login
-                await page.goto(adapter.creator_center_url, wait_until="domcontentloaded")
+                await self._await_with_timeout(
+                    page.goto(adapter.creator_center_url, wait_until="domcontentloaded"),
+                    timeout_sec=step_timeout,
+                    step_name="re-opening creator center after login",
+                )
                 await page.wait_for_timeout(1_500)
 
-            opened = await self._open_publish_entry(
-                page,
-                adapter.publish_entry_keywords,
-                adapter.fallback_publish_entry_selectors,
-            )
+            opened = await self._is_editor_ready(page)
+            if not opened:
+                opened = await self._await_with_timeout(
+                    self._open_publish_entry(
+                        page,
+                        adapter.publish_entry_keywords,
+                        adapter.fallback_publish_entry_selectors,
+                    ),
+                    timeout_sec=step_timeout,
+                    step_name="opening publish entry",
+                )
             if not opened:
                 return BrowserOperationResult(
                     status="failed",
@@ -363,15 +379,23 @@ class BrowserOperator:
                 )
 
             await page.wait_for_timeout(2_000)
-            await self._ensure_platform_publish_mode(page, adapter.name)
+            await self._await_with_timeout(
+                self._ensure_platform_publish_mode(page, adapter.name),
+                timeout_sec=step_timeout,
+                step_name="switching to image publish mode",
+            )
             await self._fill_text(page, adapter.title_selectors, title)
             await self._fill_text(page, adapter.content_selectors, content)
 
-            uploaded = await upload_files(
-                page=page,
-                image_paths=image_paths,
-                input_selectors=adapter.upload_input_selectors,
-                upload_keywords=adapter.upload_trigger_keywords,
+            uploaded = await self._await_with_timeout(
+                upload_files(
+                    page=page,
+                    image_paths=image_paths,
+                    input_selectors=adapter.upload_input_selectors,
+                    upload_keywords=adapter.upload_trigger_keywords,
+                ),
+                timeout_sec=step_timeout,
+                step_name="uploading images",
             )
             if not uploaded and adapter.name.lower() == "xhs":
                 with contextlib.suppress(Exception):
@@ -395,10 +419,14 @@ class BrowserOperator:
                     note=f"Auto upload failed. Please verify upload controls on page.{extra_hint}",
                 )
 
-            publish_button_found = await self._find_publish_button(
-                page,
-                adapter.publish_button_keywords,
-                adapter.publish_button_selectors,
+            publish_button_found = await self._await_with_timeout(
+                self._find_publish_button(
+                    page,
+                    adapter.publish_button_keywords,
+                    adapter.publish_button_selectors,
+                ),
+                timeout_sec=step_timeout,
+                step_name="checking publish button",
             )
             if not publish_button_found:
                 return BrowserOperationResult(
@@ -629,6 +657,56 @@ class BrowserOperator:
             text = text[:260] + "..."
         return text
 
+    def _step_timeout_seconds(self, total_timeout_sec: int) -> int:
+        total = int(total_timeout_sec or 240)
+        if total <= 0:
+            total = 240
+        return min(max(total // 3, 20), 60)
+
+    async def _await_with_timeout(
+        self,
+        operation: Awaitable[Any],
+        timeout_sec: int,
+        step_name: str,
+    ) -> Any:
+        try:
+            return await asyncio.wait_for(operation, timeout=max(timeout_sec, 1))
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Timed out while {step_name} after {timeout_sec}s") from exc
+
+    async def _has_visible_text(self, page: Page, text: str) -> bool:
+        with contextlib.suppress(Exception):
+            locator = page.get_by_text(text, exact=False)
+            count = await locator.count()
+            for idx in range(min(count, 3)):
+                with contextlib.suppress(Exception):
+                    if await locator.nth(idx).is_visible():
+                        return True
+        return False
+
+    async def _has_visible_locator(self, page: Page, selector: str) -> bool:
+        with contextlib.suppress(Exception):
+            locator = page.locator(selector)
+            count = await locator.count()
+            for idx in range(min(count, 3)):
+                with contextlib.suppress(Exception):
+                    if await locator.nth(idx).is_visible():
+                        return True
+        return False
+
+    async def _is_editor_ready(self, page: Page) -> bool:
+        editor_selectors = (
+            "input[accept*='image']",
+            "textarea",
+            "[contenteditable='true']",
+            "button:has-text('\\u53d1\\u5e03')",
+            "[role='button']:has-text('\\u53d1\\u5e03')",
+        )
+        for selector in editor_selectors:
+            if await self._has_visible_locator(page, selector):
+                return True
+        return False
+
     def _is_profile_locked_error(self, exc: Exception) -> bool:
         text = str(exc).lower()
         indicators = (
@@ -694,6 +772,45 @@ class BrowserOperator:
         while loop.time() < deadline:
             for page in list(context.pages):
                 if not await self._need_login_robust(page):
+                    return page
+            await asyncio.sleep(2)
+        return None
+
+    async def _need_login_visible(self, page: Page) -> bool:
+        login_keywords = (
+            "\u767b\u5f55",
+            "\u626b\u7801\u767b\u5f55",
+            "\u624b\u673a\u53f7\u767b\u5f55",
+            "Sign in",
+            "Log in",
+        )
+        for keyword in login_keywords:
+            if await self._has_visible_text(page, keyword):
+                return True
+        return await self._has_visible_locator(page, "input[type='password']")
+
+    async def _need_login_robust_visible(self, page: Page) -> bool:
+        if await self._is_editor_ready(page):
+            return False
+
+        with contextlib.suppress(Exception):
+            current_url = (page.url or "").lower()
+            if any(token in current_url for token in ("login", "signin", "passport")):
+                return True
+
+        return await self._need_login_visible(page)
+
+    async def _wait_for_manual_login_robust(self, context: BrowserContext, timeout_sec: int) -> Page | None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout_sec, 1)
+        while loop.time() < deadline:
+            for page in list(context.pages):
+                if page.is_closed():
+                    continue
+                page_url = (page.url or "").strip().lower()
+                if page_url.startswith("about:blank"):
+                    continue
+                if not await self._need_login_robust_visible(page):
                     return page
             await asyncio.sleep(2)
         return None
