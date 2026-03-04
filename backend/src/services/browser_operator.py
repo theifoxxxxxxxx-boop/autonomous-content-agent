@@ -44,16 +44,25 @@ async def upload_files(
     image_paths: list[str],
     input_selectors: list[str],
     upload_keywords: list[str],
+    image_only: bool = False,
 ) -> bool:
-    files = [str(Path(path).resolve()) for path in image_paths]
+    files = [os.path.abspath(str(Path(path).expanduser())) for path in image_paths]
 
     for selector in input_selectors:
+        if image_only and selector == "input[type='file']":
+            continue
         locator = page.locator(selector)
         count = await locator.count()
         if count == 0:
             continue
         for idx in range(count):
             with contextlib.suppress(Exception):
+                if image_only:
+                    accept = (await locator.nth(idx).get_attribute("accept") or "").lower()
+                    if "image" not in accept and not any(
+                        ext in accept for ext in ("png", "jpg", "jpeg", "webp")
+                    ):
+                        continue
                 await locator.nth(idx).set_input_files(files, timeout=4_000)
                 return True
 
@@ -64,9 +73,21 @@ async def upload_files(
             continue
         for idx in range(count):
             with contextlib.suppress(Exception):
+                if image_only:
+                    candidate = target.nth(idx)
+                    text_value = (await candidate.inner_text() or "").lower()
+                    aria_label = (await candidate.get_attribute("aria-label") or "").lower()
+                    merged_text = f"{keyword.lower()} {text_value} {aria_label}"
+                    if not any(
+                        token in merged_text
+                        for token in ("\u56fe", "image", "photo", "picture", "png", "jpg")
+                    ):
+                        continue
+                print(">>> 准备拦截文件选择器...")
                 async with page.expect_file_chooser(timeout=4_000) as chooser_info:
                     await target.nth(idx).click(timeout=3_000)
                 chooser = await chooser_info.value
+                print(f">>> 成功拦截，准备注入图片路径: {files}")
                 await chooser.set_files(files)
                 return True
     return False
@@ -256,6 +277,8 @@ class BrowserOperator:
         timeout_sec = int(self.settings.browser_operation_timeout_sec or 240)
         if timeout_sec <= 0:
             timeout_sec = 240
+        if str(getattr(adapter, "name", "")).lower() == "xhs":
+            timeout_sec = max(timeout_sec, 660)
 
         loop = asyncio.new_event_loop()
         try:
@@ -380,12 +403,15 @@ class BrowserOperator:
 
             await page.wait_for_timeout(2_000)
             await self._await_with_timeout(
-                self._ensure_platform_publish_mode(page, adapter.name),
+                self._ensure_platform_publish_mode(page, adapter.name, image_paths),
                 timeout_sec=step_timeout,
                 step_name="switching to image publish mode",
             )
-            await self._fill_text(page, adapter.title_selectors, title)
-            await self._fill_text(page, adapter.content_selectors, content)
+            if adapter.name.lower() == "xhs":
+                title_filled, content_filled = await self._fill_xhs_title_and_content_fast(page, title, content)
+            else:
+                title_filled = await self._fill_text(page, adapter.title_selectors, title)
+                content_filled = await self._fill_text(page, adapter.content_selectors, content)
 
             uploaded = await self._await_with_timeout(
                 upload_files(
@@ -393,19 +419,21 @@ class BrowserOperator:
                     image_paths=image_paths,
                     input_selectors=adapter.upload_input_selectors,
                     upload_keywords=adapter.upload_trigger_keywords,
+                    image_only=adapter.name.lower() == "xhs",
                 ),
                 timeout_sec=step_timeout,
                 step_name="uploading images",
             )
             if not uploaded and adapter.name.lower() == "xhs":
                 with contextlib.suppress(Exception):
-                    await self._ensure_xhs_image_tab(page)
+                    await self._ensure_xhs_image_tab_guarded(page, image_paths)
                     await page.wait_for_timeout(1_000)
                 uploaded = await upload_files(
                     page=page,
                     image_paths=image_paths,
                     input_selectors=adapter.upload_input_selectors,
                     upload_keywords=adapter.upload_trigger_keywords,
+                    image_only=True,
                 )
             if not uploaded:
                 extra_hint = ""
@@ -417,6 +445,23 @@ class BrowserOperator:
                     status="failed",
                     live_url="",
                     note=f"Auto upload failed. Please verify upload controls on page.{extra_hint}",
+                )
+
+            if adapter.name.lower() == "xhs":
+                retry_title_filled, retry_content_filled = await self._fill_xhs_title_and_content_fast(page, title, content)
+                title_filled = title_filled or retry_title_filled
+                content_filled = content_filled or retry_content_filled
+
+            if adapter.name.lower() == "xhs" and (not title_filled or not content_filled):
+                missing_parts = []
+                if not title_filled:
+                    missing_parts.append("title")
+                if not content_filled:
+                    missing_parts.append("content")
+                return BrowserOperationResult(
+                    status="failed",
+                    live_url="",
+                    note=f"Failed to fill editor fields: {', '.join(missing_parts)}.",
                 )
 
             publish_button_found = await self._await_with_timeout(
@@ -434,6 +479,9 @@ class BrowserOperator:
                     live_url="",
                     note="Publish button not found, cannot confirm pre-publish state.",
                 )
+
+            if adapter.name.lower() == "xhs":
+                await page.wait_for_timeout(600_000)
 
             note = (
                 "Browser is ready. Title/content/images are filled and flow is paused before publish. "
@@ -833,9 +881,14 @@ class BrowserOperator:
                     return True
         return False
 
-    async def _ensure_platform_publish_mode(self, page: Page, platform_name: str) -> None:
+    async def _ensure_platform_publish_mode(
+        self,
+        page: Page,
+        platform_name: str,
+        image_paths: list[str],
+    ) -> None:
         if platform_name.lower() == "xhs":
-            await self._ensure_xhs_image_tab(page)
+            await self._ensure_xhs_image_tab_guarded(page, image_paths)
 
     async def _ensure_xhs_image_tab(self, page: Page) -> bool:
         if await self._looks_like_xhs_image_mode(page):
@@ -889,6 +942,56 @@ class BrowserOperator:
                     return message
         return ""
 
+    async def _fill_xhs_title_and_content_fast(self, page: Page, title: str, content: str) -> tuple[bool, bool]:
+        title_value = title.strip()
+        content_value = content.strip()
+        title_filled = False
+        content_filled = False
+
+        if title_value:
+            title_selectors = [
+                "input[placeholder*='填写标题']",
+                "input.c-input_inner",
+                "input[placeholder*='标题']",
+            ]
+            for selector in title_selectors:
+                with contextlib.suppress(Exception):
+                    locator = page.locator(selector)
+                    if await locator.count() == 0:
+                        continue
+                    target = locator.first
+                    if not await target.is_visible():
+                        continue
+                    await target.click(timeout=10_000)
+                    await target.fill(title_value, timeout=10_000)
+                    title_filled = True
+                    break
+
+        if content_value:
+            content_selectors = [
+                "div.ql-editor",
+                "div[contenteditable='true'][placeholder*='输入正文']",
+                "[placeholder*='输入正文']",
+                "div[contenteditable='true']",
+            ]
+            for selector in content_selectors:
+                with contextlib.suppress(Exception):
+                    locator = page.locator(selector)
+                    if await locator.count() == 0:
+                        continue
+                    target = locator.first
+                    if not await target.is_visible():
+                        continue
+                    await target.click(timeout=10_000)
+                    with contextlib.suppress(Exception):
+                        await page.keyboard.press("Control+A")
+                        await page.keyboard.press("Backspace")
+                    await page.keyboard.insert_text(content_value)
+                    content_filled = True
+                    break
+
+        return title_filled, content_filled
+
     async def _fill_text(self, page: Page, selectors: list[str], content: str) -> bool:
         value = content.strip()
         if not value:
@@ -908,6 +1011,120 @@ class BrowserOperator:
                 await textboxes.nth(idx).fill(value, timeout=2_000)
                 return True
         return False
+
+    async def _looks_like_xhs_image_mode_strict(self, page: Page) -> bool:
+        image_selectors = (
+            "input[type='file'][accept*='image']",
+            "input[type='file'][accept*='png']",
+            "input[type='file'][accept*='jpg']",
+            "input[type='file'][accept*='jpeg']",
+            "text=\u6dfb\u52a0\u56fe\u7247",
+            "text=\u9009\u62e9\u56fe\u7247",
+            "text=\u4e0a\u4f20\u56fe\u7247",
+        )
+        for selector in image_selectors:
+            if await self._has_visible_locator(page, selector):
+                return True
+        return False
+
+    async def _ensure_xhs_image_tab_strict(self, page: Page) -> bool:
+        if await self._looks_like_xhs_image_mode_strict(page):
+            return True
+
+        print(">>> 正在切换到【上传图文】模式...")
+        with contextlib.suppress(Exception):
+            await page.get_by_text("\u4e0a\u4f20\u56fe\u6587", exact=True).click(timeout=15_000)
+            await page.wait_for_timeout(2_000)
+            if await self._looks_like_xhs_image_mode_strict(page):
+                return True
+
+        selectors = [
+            "button:has-text('\u4e0a\u4f20\u56fe\u6587')",
+            "[role='tab']:has-text('\u4e0a\u4f20\u56fe\u6587')",
+            "div:has-text('\u4e0a\u4f20\u56fe\u6587')",
+            "span:has-text('\u4e0a\u4f20\u56fe\u6587')",
+            "a:has-text('\u4e0a\u4f20\u56fe\u6587')",
+            "button:has-text('\u56fe\u6587')",
+            "[role='tab']:has-text('\u56fe\u6587')",
+            "div:has-text('\u56fe\u6587')",
+            "span:has-text('\u56fe\u6587')",
+            "a:has-text('\u56fe\u6587')",
+            "text=\u4e0a\u4f20\u56fe\u6587",
+            "text=\u56fe\u6587",
+        ]
+        for _ in range(3):
+            for selector in selectors:
+                with contextlib.suppress(Exception):
+                    locator = page.locator(selector)
+                    if await locator.count() == 0:
+                        continue
+                    await locator.first.click(timeout=8_000)
+                    await page.wait_for_timeout(1_200)
+                    if await self._looks_like_xhs_image_mode_strict(page):
+                        return True
+        return await self._looks_like_xhs_image_mode_strict(page)
+
+    async def _click_with_file_chooser_guard(
+        self,
+        page: Page,
+        locator: Any,
+        files: list[str],
+        click_timeout_ms: int = 5_000,
+        chooser_timeout_ms: int = 2_500,
+    ) -> bool:
+        try:
+            print(">>> 准备拦截文件选择器...")
+            async with page.expect_file_chooser(timeout=chooser_timeout_ms) as chooser_info:
+                await locator.click(timeout=click_timeout_ms)
+            file_chooser = await chooser_info.value
+            print(f">>> 成功拦截，准备注入图片路径: {files}")
+            await file_chooser.set_files(files)
+            return True
+        except PlaywrightTimeoutError:
+            return False
+
+    async def _ensure_xhs_image_tab_guarded(self, page: Page, image_paths: list[str]) -> bool:
+        if await self._looks_like_xhs_image_mode_strict(page):
+            return True
+
+        files = [os.path.abspath(str(Path(path).expanduser())) for path in image_paths]
+        print(">>> 正在切换到【上传图文】模式...")
+
+        with contextlib.suppress(Exception):
+            upload_tab = page.get_by_text("\u4e0a\u4f20\u56fe\u6587", exact=True)
+            intercepted = await self._click_with_file_chooser_guard(
+                page=page,
+                locator=upload_tab,
+                files=files,
+                click_timeout_ms=15_000,
+                chooser_timeout_ms=3_000,
+            )
+            if not intercepted:
+                await upload_tab.click(timeout=15_000)
+            await page.wait_for_timeout(1_600)
+            if await self._looks_like_xhs_image_mode_strict(page):
+                return True
+
+        tab_selectors = [
+            "button[role='tab']:has-text('\u56fe\u6587')",
+            "[role='tab']:has-text('\u56fe\u6587')",
+            "button:has-text('\u56fe\u6587')",
+            "a:has-text('\u56fe\u6587')",
+        ]
+        for _ in range(2):
+            for selector in tab_selectors:
+                with contextlib.suppress(Exception):
+                    locator = page.locator(selector)
+                    if await locator.count() == 0:
+                        continue
+                    first = locator.first
+                    if not await first.is_visible():
+                        continue
+                    await first.click(timeout=4_000)
+                    await page.wait_for_timeout(800)
+                    if await self._looks_like_xhs_image_mode_strict(page):
+                        return True
+        return await self._looks_like_xhs_image_mode_strict(page)
 
     async def _find_publish_button(self, page: Page, keywords: list[str], selectors: list[str]) -> bool:
         for keyword in keywords:
