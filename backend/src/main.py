@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.config import get_settings
 from src.schemas import HealthResponse, JobCreateResponse, JobEventsResponse, JobStateResponse, PlatformType
@@ -16,11 +19,49 @@ from src.services.event_bus import EventBus
 from src.workflow.graph import WorkflowEngine
 from src.workflow.state import AgentState, state_snapshot
 
+
+def _force_windows_proactor_policy() -> None:
+    if sys.platform != "win32":
+        return
+    policy_cls = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+    if policy_cls is None:
+        return
+    current = asyncio.get_event_loop_policy()
+    if not isinstance(current, policy_cls):
+        asyncio.set_event_loop_policy(policy_cls())
+
+
+def _loop_supports_async_subprocess() -> bool:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return True
+
+    if sys.platform == "win32":
+        selector_cls = getattr(asyncio, "SelectorEventLoop", None)
+        if selector_cls is not None and isinstance(loop, selector_cls):
+            return False
+        if "SelectorEventLoop" in type(loop).__name__:
+            return False
+    return True
+
+
+_force_windows_proactor_policy()
 settings = get_settings()
 event_bus = EventBus()
 workflow_engine = WorkflowEngine(settings=settings, event_bus=event_bus)
 
-app = FastAPI(title="Autonomous Content Agent API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _force_windows_proactor_policy()
+    loop = asyncio.get_running_loop()
+    app.state.loop_policy = type(asyncio.get_event_loop_policy()).__name__
+    app.state.loop_type = type(loop).__name__
+    app.state.subprocess_supported = _loop_supports_async_subprocess()
+    yield
+
+
+app = FastAPI(title="Autonomous Content Agent API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -28,6 +69,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def _startup_force_proactor() -> None:
+    _force_windows_proactor_policy()
+    app.state.subprocess_supported = _loop_supports_async_subprocess()
+
+
+@app.middleware("http")
+async def catch_unhandled_exceptions(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        )
 
 
 def _sse_message(event: dict) -> str:
@@ -70,14 +131,16 @@ async def _execute_job(initial_state: AgentState) -> None:
             {"state": state_snapshot(result_state)},
         )
     except Exception as exc:
+        trace = traceback.format_exc()
         failed_state = dict(initial_state)
         failed_state["error"] = str(exc)
+        failed_state["traceback"] = trace
         await event_bus.mark_failed(job_id, failed_state)
         await event_bus.publish(
             job_id,
             "JOB_FAILED",
             "任务执行异常",
-            {"state": state_snapshot(failed_state), "error": str(exc)},
+            {"state": state_snapshot(failed_state), "error": str(exc), "traceback": trace},
         )
 
 

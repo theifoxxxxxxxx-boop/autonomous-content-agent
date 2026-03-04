@@ -27,4 +27,6 @@ src/workflow/__init__.py
 src/workflow/graph.py
 src/workflow/routing.py
 src/workflow/state.py
+tests/test_event_bus.py
+tests/test_json_utils.py
 tests/test_review_rules.py

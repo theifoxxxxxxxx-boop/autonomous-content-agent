@@ -12,6 +12,18 @@ from src.services.model_clients import ModelClients
 from src.workflow.routing import review_route
 from src.workflow.state import AgentState, state_snapshot, with_default_state
 
+
+def _dedupe(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
+
+
+def _is_subjective_title_issue(text: str) -> bool:
+    value = (text or "").lower()
+    title_keywords = ("标题", "title")
+    subjective_keywords = ("吸引", "钩子", "抓人", "不够亮眼", "不够有力", "click")
+    return any(key in value for key in title_keywords) and any(key in value for key in subjective_keywords)
+
+
 class WorkflowEngine:
     def __init__(self, settings: Settings, event_bus: EventBus):
         self.settings = settings
@@ -49,12 +61,12 @@ class WorkflowEngine:
         return await self.graph.ainvoke(state)
 
     async def node_a_vision(self, state: AgentState) -> dict[str, Any]:
-        await self._emit(state, "NODE_START", "Node A 视觉分析开始", {"node": "A"})
+        await self._emit(state, "NODE_START", "Node A visual analysis started", {"node": "A"})
         analysis = await self.models.analyze_images(state.get("image_paths", []))
         await self._emit(
             state,
             "NODE_LOG",
-            "Node A 视觉分析完成",
+            "Node A visual analysis completed",
             {"node": "A", "vision_analysis": analysis},
         )
         return {"vision_analysis": analysis}
@@ -63,7 +75,7 @@ class WorkflowEngine:
         await self._emit(
             state,
             "NODE_START",
-            "Node B 爆款文案生成中",
+            "Node B copywriting in progress",
             {"node": "B", "retry_count": state.get("retry_count", 0)},
         )
         generated = await self.models.generate_copy(
@@ -75,7 +87,7 @@ class WorkflowEngine:
         await self._emit(
             state,
             "DRAFT_UPDATED",
-            "Node B 文案已更新",
+            "Node B draft updated",
             {
                 "node": "B",
                 "draft_title": generated["title"],
@@ -89,7 +101,7 @@ class WorkflowEngine:
         }
 
     async def node_c_review(self, state: AgentState) -> dict[str, Any]:
-        await self._emit(state, "NODE_START", "Node C 主编审稿中", {"node": "C"})
+        await self._emit(state, "NODE_START", "Node C editorial review in progress", {"node": "C"})
 
         deterministic = evaluate_deterministic_rules(
             platform=state["platform"],
@@ -104,39 +116,96 @@ class WorkflowEngine:
             deterministic_issues=deterministic["issues"],
         )
 
-        issues = list(dict.fromkeys([*deterministic["issues"], *llm_review.get("issues", [])]))
-        rewrite_instructions = list(
-            dict.fromkeys(
-                [
-                    *deterministic["rewrite_instructions"],
-                    *llm_review.get("rewrite_instructions", []),
-                ]
-            )
+        all_issues = _dedupe([*deterministic["issues"], *llm_review.get("issues", [])])
+        all_rewrite_instructions = _dedupe(
+            [
+                *deterministic["rewrite_instructions"],
+                *llm_review.get("rewrite_instructions", []),
+            ]
         )
-        passed = bool(deterministic["passed"] and llm_review.get("passed", False) and len(issues) == 0)
+
+        subjective_title_issues = [item for item in all_issues if _is_subjective_title_issue(item)]
+        blocking_issues = [item for item in all_issues if item not in subjective_title_issues]
+
+        advisory_suggestions = _dedupe(
+            [
+                *deterministic.get("advisory_suggestions", []),
+                *subjective_title_issues,
+            ]
+        )
+
+        blocking_rewrite_instructions = [
+            item
+            for item in all_rewrite_instructions
+            if not _is_subjective_title_issue(item)
+        ]
+
+        llm_effective_passed = bool(llm_review.get("passed", False))
+        if not llm_effective_passed and blocking_issues == [] and subjective_title_issues:
+            llm_effective_passed = True
+
+        passed = bool(
+            deterministic["passed"]
+            and llm_effective_passed
+            and len(blocking_issues) == 0
+        )
 
         if passed:
             await self._emit(
                 state,
                 "REVIEW_PASSED",
-                "Node C 审稿通过",
-                {"node": "C", "metrics": {"zh_char_count": deterministic["zh_char_count"], "emoji_count": deterministic["emoji_count"]}},
+                "Node C review passed",
+                {
+                    "node": "C",
+                    "metrics": {
+                        "zh_char_count": deterministic["zh_char_count"],
+                        "emoji_count": deterministic["emoji_count"],
+                    },
+                    "advisory_suggestions": advisory_suggestions,
+                },
             )
             return {"review_passed": True, "critique_feedback": ""}
 
         retry_count = int(state.get("retry_count", 0)) + 1
-        critique_feedback = "；".join(rewrite_instructions) or "请提升可读性和吸引力，保持合规。"
+        max_retries = int(state.get("max_retries", 3))
+
+        critique_feedback = "；".join(blocking_rewrite_instructions) or "请保持合规并提升可读性。"
+
+        if retry_count >= max_retries:
+            force_note = "审核未完全通过但强制输出当前最佳版本。"
+            await self._emit(
+                state,
+                "REVIEW_FORCED_PASS",
+                "Node C reached max retries; force output enabled",
+                {
+                    "node": "C",
+                    "issues": blocking_issues,
+                    "advisory_suggestions": advisory_suggestions,
+                    "replacement_suggestions": deterministic["replacement_suggestions"],
+                    "retry_count": retry_count,
+                    "max_retries": max_retries,
+                    "force_pass_note": force_note,
+                },
+            )
+            return {
+                "review_passed": True,
+                "retry_count": retry_count,
+                "critique_feedback": "",
+                "browser_note": force_note,
+            }
+
         await self._emit(
             state,
             "REVIEW_FAILED",
-            "Node C 审稿未通过，回到 Node B 重写",
+            "Node C review failed; back to Node B rewrite",
             {
                 "node": "C",
-                "issues": issues,
-                "rewrite_instructions": rewrite_instructions,
+                "issues": blocking_issues,
+                "rewrite_instructions": blocking_rewrite_instructions,
+                "advisory_suggestions": advisory_suggestions,
                 "replacement_suggestions": deterministic["replacement_suggestions"],
                 "retry_count": retry_count,
-                "max_retries": state.get("max_retries", 3),
+                "max_retries": max_retries,
             },
         )
         return {
@@ -146,7 +215,7 @@ class WorkflowEngine:
         }
 
     async def node_d_browser(self, state: AgentState) -> dict[str, Any]:
-        await self._emit(state, "NODE_START", "Node D 浏览器操盘开始", {"node": "D"})
+        await self._emit(state, "NODE_START", "Node D browser automation started", {"node": "D"})
         browser_llm = None
         if self.settings.browser_use_enabled:
             try:
@@ -163,7 +232,7 @@ class WorkflowEngine:
         await self._emit(
             state,
             "NODE_LOG",
-            "Node D 浏览器操盘完成",
+            "Node D browser automation completed",
             {
                 "node": "D",
                 "browser_status": browser_result.status,
@@ -180,13 +249,13 @@ class WorkflowEngine:
     async def node_e_notify(self, state: AgentState) -> dict[str, Any]:
         if not state.get("review_passed", False):
             note = (
-                "达到最大重写次数，未进入浏览器发布阶段。"
-                "请根据审稿意见调整需求后重新生成。"
+                "Maximum rewrites reached and review still not passed. "
+                "Please adjust requirements and regenerate."
             )
             await self._emit(
                 state,
                 "JOB_FAILED",
-                "Node E 通知：审稿未通过且已达最大重试次数",
+                "Node E notify: review not passed and retries exhausted",
                 {
                     "node": "E",
                     "human_instructions": note,
@@ -195,7 +264,6 @@ class WorkflowEngine:
             )
             return {"browser_status": "skipped", "browser_note": note, "error": "review_retries_exhausted"}
 
-        browser_status = state.get("browser_status", "")
         common_data = {
             "draft_title": state.get("draft_title", ""),
             "draft_content": state.get("draft_content", ""),
@@ -203,12 +271,13 @@ class WorkflowEngine:
             "live_url": state.get("browser_live_url", ""),
             "human_instructions": state.get("browser_note", ""),
         }
+        browser_status = state.get("browser_status", "")
         if browser_status == "ready":
-            await self._emit(state, "BROWSER_READY", "浏览器已就绪，请人工确认发布", common_data)
+            await self._emit(state, "BROWSER_READY", "Browser ready, please confirm publish manually", common_data)
         elif browser_status == "need_login":
-            await self._emit(state, "BROWSER_NEED_LOGIN", "浏览器需要先登录创作中心", common_data)
+            await self._emit(state, "BROWSER_NEED_LOGIN", "Browser needs login before publishing", common_data)
         else:
-            await self._emit(state, "BROWSER_FAILED", "浏览器操盘失败", common_data)
+            await self._emit(state, "BROWSER_FAILED", "Browser automation failed", common_data)
             return {"error": state.get("error", "") or "browser_failed"}
         return {}
 

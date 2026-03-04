@@ -11,15 +11,19 @@ class BannedRule:
     suggestion: str
 
 
+# Keep illegal ad claims, but avoid over-blocking neutral wording such as:
+# 最近 / 最佳 / 最后 / 最初
 BANNED_RULES: list[BannedRule] = [
-    BannedRule(pattern=r"全网第一", suggestion="全网热议"),
-    BannedRule(pattern=r"第一", suggestion="前列"),
-    BannedRule(pattern=r"绝对", suggestion="相对更"),
-    BannedRule(pattern=r"100%", suggestion="高概率"),
-    BannedRule(pattern=r"最", suggestion="更"),
-    BannedRule(pattern=r"顶级", suggestion="高品质"),
-    BannedRule(pattern=r"无敌", suggestion="表现很强"),
-    BannedRule(pattern=r"唯一", suggestion="少见"),
+    BannedRule(
+        pattern=r"全网第一|行业第一|全国第一|第一品牌|销量第一|No\.?1|TOP1",
+        suggestion="改为客观可验证描述，如“口碑较好”",
+    ),
+    BannedRule(
+        pattern=r"第一(?!步|次|章|季|期|天|个|眼|时间|印象|反应|阶段|现场)",
+        suggestion="改为“前列/领先梯队/表现优秀”",
+    ),
+    BannedRule(pattern=r"顶级", suggestion="改为“高品质/高标准”"),
+    BannedRule(pattern=r"国家级", suggestion="改为“专业级/行业认可”"),
 ]
 
 
@@ -64,32 +68,32 @@ def evaluate_deterministic_rules(platform: str, title: str, content: str) -> dic
     issues: list[str] = []
     rewrite_instructions: list[str] = []
     replacement_suggestions: list[dict[str, str]] = []
+    advisory_suggestions: list[str] = []
 
     zh_count = approximate_chinese_char_count(content)
     if platform == "xhs" and not (200 <= zh_count <= 500):
-        issues.append(f"小红书正文中文字符数需在 200-500，当前约 {zh_count}。")
+        issues.append(f"小红书正文字数需在 200-500，当前约 {zh_count}。")
         rewrite_instructions.append("将正文改写到 200-500 字，保持分段和信息密度。")
 
     emoji_count = count_emoji(content)
-    if emoji_count < 6:
-        issues.append(f"Emoji 数量不足（当前 {emoji_count}，要求至少 6）。")
-        rewrite_instructions.append("在每段加入自然的 Emoji 表达情绪，至少 6 个。")
+    if platform == "xhs" and emoji_count < 3:
+        issues.append(f"Emoji 数量不足（当前 {emoji_count}，至少 3 个）。")
+        rewrite_instructions.append("补充自然 Emoji 增强氛围，至少 3 个。")
 
     banned = detect_banned_terms(f"{title}\n{content}")
     if banned:
         for item in banned:
             issues.append(f"命中疑似极限词/违禁词：{item['pattern']}")
             replacement_suggestions.append(item)
-        rewrite_instructions.append("替换所有极限词，改为客观可验证表达。")
+        rewrite_instructions.append("替换极限词，改为客观可验证表达。")
 
     title_len = len((title or "").strip())
     has_hook = bool(re.search(r"[?!？！]|[0-9]", title or ""))
     if title_len < 12 or not has_hook:
-        issues.append("标题吸引力不足（建议更强钩子、数字或反差）。")
-        rewrite_instructions.append("重写标题：加入数字/结果导向/反差，但不夸大。")
+        advisory_suggestions.append("标题吸引力可优化：建议增加数字、结果导向或反差。")
 
     if len((content or "").strip().splitlines()) < 3:
-        issues.append("正文结构不够可读（分段不足）。")
+        issues.append("正文结构可读性不足（分段不够）。")
         rewrite_instructions.append("正文拆分为 3-6 段，每段一句核心观点。")
 
     passed = len(issues) == 0
@@ -98,6 +102,7 @@ def evaluate_deterministic_rules(platform: str, title: str, content: str) -> dic
         "issues": issues,
         "rewrite_instructions": rewrite_instructions,
         "replacement_suggestions": replacement_suggestions,
+        "advisory_suggestions": advisory_suggestions,
         "zh_char_count": zh_count,
         "emoji_count": emoji_count,
     }
