@@ -158,20 +158,28 @@ class ModelClients:
 
         self._ensure_required_key("DEEPSEEK_API_KEY", self.settings.deepseek_api_key, "Node C")
         prompt = (
-            "You are the editorial reviewer.\n"
-            "Return ONLY one valid JSON object.\n"
-            "No markdown, no code fences, no explanation text.\n"
-            'If a string contains double quotes, escape them as \\".\n'
+            "You are a pragmatic and efficient editorial reviewer.\n"
+            "Your core goal is to APPROVE (pass) the content unless there are FATAL logic flaws. "
+            "DO NOT be a perfectionist.\n"
             "Input:\n"
             "platform: {platform}\n"
             "requirement: {requirement}\n"
             "title: {title}\n"
             "content: {content}\n"
             "deterministic_issues: {issues}\n"
-            "Hard rules:\n"
-            "1) if deterministic_issues is not empty, passed must be false\n"
-            "2) issues must be short strings\n"
-            "3) rewrite_instructions must be actionable Chinese instructions\n"
+            "Hard Rules for Review:\n"
+            "1) If deterministic_issues is not empty, passed MUST be false.\n"
+            "2) TOLERANCE RULE: If the content basically covers the {requirement} and matches the general "
+            "{platform} style, passed MUST be true.\n"
+            "3) ANTI-NITPICKING: DO NOT reject (passed=false) for subjective stylistic preferences "
+            "(e.g., \"could be more engaging\", \"needs more emojis\", \"tone could be better\"). "
+            "Ignore minor imperfections.\n"
+            "4) ONLY reject if the content is completely off-topic, violates the core requirement entirely, "
+            "or has severe formatting errors.\n"
+            "5) issues must be short strings.\n"
+            "6) rewrite_instructions must be actionable Chinese instructions.\n"
+            "Return ONLY one valid JSON object. No markdown, no code fences, no explanation text.\n"
+            'If a string contains double quotes, escape them as \\".\n'
             '{{"passed": true/false, "issues": ["..."], "rewrite_instructions": ["..."]}}'
         ).format(
             platform=platform,

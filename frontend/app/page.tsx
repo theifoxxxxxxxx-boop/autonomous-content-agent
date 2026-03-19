@@ -12,6 +12,27 @@ interface BrowserReadyState {
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
+const NODE_LABELS: Record<string, string> = {
+  A: "视觉分析 (Node A)",
+  B: "文案生成 (Node B)",
+  C: "审核校验 (Node C)",
+  D: "浏览器自动化 (Node D)",
+  E: "通知 (Node E)",
+};
+
+function getTimelineDotClass(type: string): string {
+  if (type === "NODE_START") return "timeline-dot is-start";
+  if (type === "JOB_FAILED" || type === "REVIEW_FAILED" || type === "BROWSER_FAILED")
+    return "timeline-dot is-fail";
+  if (
+    type === "JOB_COMPLETED" ||
+    type === "REVIEW_PASSED" ||
+    type === "BROWSER_READY"
+  )
+    return "timeline-dot is-done";
+  return "timeline-dot";
+}
+
 export default function HomePage() {
   const [platform, setPlatform] = useState<Platform>("xhs");
   const [requirement, setRequirement] = useState("");
@@ -31,12 +52,21 @@ export default function HomePage() {
     instructions: "",
   });
 
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
+  const isRunning = useMemo(
+    () => isSubmitting || (jobId !== "" && jobFinalStatus === ""),
+    [isSubmitting, jobId, jobFinalStatus],
+  );
+
   const readyTag = useMemo(() => {
-    if (browserState.status === "ready") return { cls: "tag tag-ok", text: "浏览器已就绪" };
-    if (browserState.status === "need_login") return { cls: "tag tag-warn", text: "需要先登录" };
-    if (browserState.status === "failed") return { cls: "tag tag-warn", text: "浏览器失败" };
+    if (browserState.status === "ready")
+      return { cls: "tag tag-ok", text: "浏览器已就绪" };
+    if (browserState.status === "need_login")
+      return { cls: "tag tag-warn", text: "需要先登录" };
+    if (browserState.status === "failed")
+      return { cls: "tag tag-fail", text: "浏览器失败" };
     return null;
   }, [browserState.status]);
 
@@ -48,6 +78,7 @@ export default function HomePage() {
     };
   }, []);
 
+  /* ---- SSE ---- */
   const connectSse = (createdJobId: string) => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
@@ -115,6 +146,7 @@ export default function HomePage() {
     eventSourceRef.current = source;
   };
 
+  /* ---- Submit ---- */
   const onSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!requirement.trim()) {
@@ -161,14 +193,7 @@ export default function HomePage() {
     }
   };
 
-  const NODE_LABELS: Record<string, string> = {
-    A: "视觉分析 (Node A)",
-    B: "文案生成 (Node B)",
-    C: "审核校验 (Node C)",
-    D: "浏览器自动化 (Node D)",
-    E: "通知 (Node E)",
-  };
-
+  /* ---- Resume ---- */
   const onResume = async () => {
     if (!jobId) return;
     setIsResuming(true);
@@ -185,10 +210,15 @@ export default function HomePage() {
         const text = await response.text();
         throw new Error(text || "恢复执行失败");
       }
-      const data = (await response.json()) as { job_id: string; resumed_from_node: string };
+      const data = (await response.json()) as {
+        job_id: string;
+        resumed_from_node: string;
+      };
       setJobId(data.job_id);
       setFailedNode("");
-      setStatusText(`从节点 ${data.resumed_from_node} 恢复执行，新任务: ${data.job_id}`);
+      setStatusText(
+        `从节点 ${data.resumed_from_node} 恢复执行，新任务: ${data.job_id}`,
+      );
       connectSse(data.job_id);
     } catch (error) {
       setStatusText(error instanceof Error ? error.message : "恢复执行失败");
@@ -197,120 +227,216 @@ export default function HomePage() {
     }
   };
 
+  /* ---- Status dot class ---- */
+  const statusDotClass = useMemo(() => {
+    if (isRunning) return "status-dot running";
+    if (jobFinalStatus === "failed") return "status-dot failed";
+    if (jobFinalStatus === "completed") return "status-dot completed";
+    return "status-dot";
+  }, [isRunning, jobFinalStatus]);
+
   return (
     <main className="page">
-      <h1 className="title">Autonomous Content Agent / 自媒体操盘手</h1>
-      <p className="subtitle">
-        上传图片 + 输入需求 + 选择平台，自动生成文案并打开创作中心，停在发布按钮前交由人工确认。
-      </p>
+      {/* ===== Header ===== */}
+      <header className="page-header">
+        <h1 className="title">自媒体操盘手</h1>
+        <p className="subtitle">
+          上传图片，输入需求，选择平台 — 自动生成文案并打开创作中心，停在发布按钮前交由人工确认。
+        </p>
+      </header>
 
-      <div className="grid">
-        <section className="card">
-          <form onSubmit={onSubmit}>
-            <div className="field">
-              <label htmlFor="platform">平台</label>
-              <select id="platform" value={platform} onChange={(e) => setPlatform(e.target.value as Platform)}>
-                <option value="xhs">小红书 (xhs)</option>
-                <option value="douyin">抖音 (douyin)</option>
-              </select>
-            </div>
+      <hr className="divider" />
 
-            <div className="field">
-              <label htmlFor="requirement">需求描述</label>
-              <textarea
-                id="requirement"
-                placeholder="例如：主打真实测评风格，强调前后对比，目标女性 25-35 岁"
-                value={requirement}
-                onChange={(e) => setRequirement(e.target.value)}
-              />
-            </div>
+      {/* ===== Form Section ===== */}
+      <section className="section">
+        <form onSubmit={onSubmit}>
+          <div className="field">
+            <label className="field-label" htmlFor="platform">
+              平台
+            </label>
+            <select
+              id="platform"
+              value={platform}
+              onChange={(e) => setPlatform(e.target.value as Platform)}
+            >
+              <option value="xhs">小红书</option>
+              <option value="douyin">抖音</option>
+            </select>
+          </div>
 
-            <div className="field">
-              <label htmlFor="images">上传图片（可多张）</label>
+          <div className="field">
+            <label className="field-label" htmlFor="requirement">
+              需求描述
+            </label>
+            <textarea
+              id="requirement"
+              placeholder="例如：主打真实测评风格，强调前后对比，目标女性 25-35 岁"
+              value={requirement}
+              onChange={(e) => setRequirement(e.target.value)}
+            />
+          </div>
+
+          <div className="field">
+            <label className="field-label">素材图片</label>
+            <div
+              className="upload-area"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <svg
+                className="upload-icon"
+                viewBox="0 0 20 20"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+              >
+                <path d="M10 4v12M4 10h12" strokeLinecap="round" />
+              </svg>
+              <span className="upload-text">
+                点击选择图片，支持多张
+              </span>
+              {files.length > 0 && (
+                <span className="upload-count">
+                  已选 {files.length} 张
+                </span>
+              )}
               <input
-                id="images"
+                ref={fileInputRef}
                 type="file"
                 accept="image/*"
                 multiple
                 onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
               />
-              <span className="hint">当前已选 {files.length} 张图片</span>
             </div>
+          </div>
 
-            <button className="btn btn-primary" type="submit" disabled={isSubmitting}>
-              {isSubmitting ? "提交中..." : "开始执行"}
+          <button
+            className="btn btn-primary"
+            type="submit"
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? "提交中..." : "开始执行"}
+          </button>
+        </form>
+
+        {/* Status bar */}
+        <div className="status-bar">
+          <span className={statusDotClass} />
+          <span>{statusText}</span>
+        </div>
+
+        {/* Meta info */}
+        {(jobId || jobFinalStatus) && (
+          <div className="status-meta">
+            {jobId && <span>ID: {jobId.slice(0, 12)}...</span>}
+            {jobId && (
+              <Link href={`/replay?job_id=${jobId}`}>查看回放</Link>
+            )}
+            {jobFinalStatus && <span>状态: {jobFinalStatus}</span>}
+          </div>
+        )}
+
+        {/* Resume block */}
+        {jobFinalStatus === "failed" && failedNode && (
+          <div className="resume-block">
+            <p className="resume-block-title">
+              失败节点：{NODE_LABELS[failedNode] ?? failedNode}
+            </p>
+            <p className="resume-block-desc">
+              可从失败节点恢复执行，跳过已成功的节点，节省时间和 Token。
+            </p>
+            <button
+              className="btn btn-primary"
+              onClick={onResume}
+              disabled={isResuming}
+            >
+              {isResuming ? "恢复中..." : `从节点 ${failedNode} 重试`}
             </button>
-          </form>
-          <p className="hint" style={{ marginTop: 12 }}>
-          当前状态：{statusText}
-        </p>
-          {jobId ? <p className="hint">Job ID: {jobId}</p> : null}
-          {jobId ? (
-            <p className="hint">
-              <Link href={`/replay?job_id=${jobId}`}>Open Run Replay</Link>
-            </p>
-          ) : null}
-          {jobFinalStatus ? <p className="hint">最终状态：{jobFinalStatus}</p> : null}
-          {jobFinalStatus === "failed" && failedNode && (
-            <div style={{ marginTop: 12, padding: "10px 14px", background: "#fff3f3", borderRadius: 8, border: "1px solid #ffccc7" }}>
-              <p style={{ margin: 0, color: "#cf1322", fontWeight: 600 }}>
-                失败节点：{NODE_LABELS[failedNode] ?? failedNode}
-              </p>
-              <p style={{ margin: "6px 0 10px", color: "#595959", fontSize: 13 }}>
-                可从失败节点恢复执行，跳过已成功的节点，节省时间和 Token。
-              </p>
-              <button
-                className="btn btn-primary"
-                onClick={onResume}
-                disabled={isResuming}
-                style={{ fontSize: 14 }}
-              >
-                {isResuming ? "恢复中..." : `从节点 ${failedNode} 重试`}
-              </button>
-            </div>
-          )}
-        </section>
+          </div>
+        )}
+      </section>
 
-        <section className="card">
-          <h3 style={{ marginTop: 0 }}>实时日志（SSE）</h3>
-          <ul className="log-list">
-            {logs.map((item, idx) => (
-              <li className="log-item" key={`${item.timestamp}-${idx}`}>
-                <div>
-                  <strong>{item.type}</strong> ·{" "}
-                  <span>
-                    {item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : "--:--:--"}
-                  </span>
-                </div>
-                <div>{item.message}</div>
-              </li>
-            ))}
-          </ul>
-        </section>
-      </div>
+      <hr className="divider" />
 
-      <div className="grid">
-        <section className="card">
-          <h3 style={{ marginTop: 0 }}>标题正文预览</h3>
-          <div className="preview-title">{draftTitle || "（等待生成标题）"}</div>
-          <div className="preview-content">{draftContent || "（等待生成正文）"}</div>
-        </section>
-
-        <section className="card">
-          <h3 style={{ marginTop: 0 }}>浏览器就绪状态</h3>
-          {readyTag ? <span className={readyTag.cls}>{readyTag.text}</span> : <span className="hint">尚未到达浏览器节点</span>}
-          <p className="hint" style={{ marginTop: 10 }}>
-            {browserState.instructions || "Node D 完成后会在这里提示下一步。"}
-          </p>
-          {browserState.liveUrl ? (
-            <a className="btn btn-ghost" href={browserState.liveUrl} target="_blank" rel="noreferrer">
-              打开 Cloud Live URL
-            </a>
+      {/* ===== Logs + Preview ===== */}
+      <div className="content-grid">
+        {/* Left: Timeline logs */}
+        <section>
+          <p className="section-label">实时日志</p>
+          {logs.length === 0 ? (
+            <p className="field-hint">任务启动后，事件流将在此显示。</p>
           ) : (
-            <p className="hint">
-              若为本地 Real Browser 模式，请直接查看本机弹出的 Chrome 窗口。
-            </p>
+            <ul className="timeline">
+              {logs.map((item, idx) => (
+                <li
+                  className="timeline-item"
+                  key={`${item.timestamp}-${idx}`}
+                >
+                  <span className={getTimelineDotClass(item.type)} />
+                  <div className="timeline-body">
+                    <div>
+                      <span className="timeline-type">{item.type}</span>
+                      <span className="timeline-time">
+                        {item.timestamp
+                          ? new Date(item.timestamp).toLocaleTimeString()
+                          : "--:--:--"}
+                      </span>
+                    </div>
+                    <div className="timeline-msg">{item.message}</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
           )}
+        </section>
+
+        {/* Right: Preview + Browser */}
+        <section>
+          <p className="section-label">内容预览</p>
+          <div className="preview-block">
+            {draftTitle ? (
+              <div className="preview-title">{draftTitle}</div>
+            ) : (
+              <div className="preview-title preview-placeholder">
+                等待生成标题...
+              </div>
+            )}
+            {draftContent ? (
+              <div className="preview-content">{draftContent}</div>
+            ) : (
+              <div className="preview-content preview-placeholder">
+                等待生成正文...
+              </div>
+            )}
+          </div>
+
+          {/* Browser status */}
+          <div className="browser-section">
+            <p className="section-label">浏览器状态</p>
+            {readyTag ? (
+              <span className={readyTag.cls}>{readyTag.text}</span>
+            ) : (
+              <span className="field-hint">尚未到达浏览器节点</span>
+            )}
+            <p className="field-hint" style={{ marginTop: 8 }}>
+              {browserState.instructions ||
+                "Node D 完成后会在这里提示下一步。"}
+            </p>
+            {browserState.liveUrl ? (
+              <a
+                className="btn btn-ghost"
+                href={browserState.liveUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ marginTop: 8 }}
+              >
+                打开 Cloud Live URL
+              </a>
+            ) : (
+              <p className="field-hint">
+                若为本地模式，请直接查看本机弹出的 Chrome 窗口。
+              </p>
+            )}
+          </div>
         </section>
       </div>
     </main>
