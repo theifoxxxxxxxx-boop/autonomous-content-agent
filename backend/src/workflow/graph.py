@@ -56,9 +56,66 @@ class WorkflowEngine:
         graph.add_edge("node_e_notify", END)
         return graph.compile()
 
+    # Ordered node names and their corresponding label used in events
+    NODE_ORDER = ["A", "B", "C", "D", "E"]
+    NODE_LABEL_TO_METHOD = {
+        "A": "node_a_vision",
+        "B": "node_b_copy",
+        "C": "node_c_review",
+        "D": "node_d_browser",
+        "E": "node_e_notify",
+    }
+
     async def run(self, input_state: AgentState) -> AgentState:
         state = with_default_state(input_state)
+        resume = state.get("resume_from_node", "")
+        if resume:
+            return await self.run_from(state, resume)
         return await self.graph.ainvoke(state)
+
+    async def run_from(self, state: AgentState, from_node: str) -> AgentState:
+        """Resume execution starting from *from_node*, skipping earlier nodes.
+
+        Handles the C→B rewrite loop the same way the full graph does.
+        """
+        state = with_default_state(state)
+        # Clear previous error so the resumed run starts clean
+        state["error"] = ""
+        state["resume_from_node"] = ""
+
+        try:
+            start_idx = self.NODE_ORDER.index(from_node)
+        except ValueError:
+            raise ValueError(f"Unknown node label: {from_node}")
+
+        remaining = self.NODE_ORDER[start_idx:]
+
+        i = 0
+        while i < len(remaining):
+            label = remaining[i]
+            method_name = self.NODE_LABEL_TO_METHOD[label]
+            method = getattr(self, method_name)
+            updates = await method(state)
+            state.update(updates)
+
+            # After Node C, honour the conditional routing logic
+            if label == "C":
+                route = review_route(state)
+                if route == "to_rewrite":
+                    # Jump back to B, then C will run again
+                    b_updates = await self.node_b_copy(state)
+                    state.update(b_updates)
+                    # Don't advance i — re-run C on next iteration
+                    continue
+                elif route == "to_notify":
+                    # Skip D, go straight to E
+                    e_updates = await self.node_e_notify(state)
+                    state.update(e_updates)
+                    break
+
+            i += 1
+
+        return state
 
     async def node_a_vision(self, state: AgentState) -> dict[str, Any]:
         await self._emit(state, "NODE_START", "Node A visual analysis started", {"node": "A"})

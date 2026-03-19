@@ -30,6 +30,7 @@ class AgentState(TypedDict, total=False):
     browser_live_url: str
     browser_note: str
     error: str
+    resume_from_node: str
 
 
 def with_default_state(input_state: AgentState) -> AgentState:
@@ -45,6 +46,7 @@ def with_default_state(input_state: AgentState) -> AgentState:
     state.setdefault("browser_live_url", "")
     state.setdefault("browser_note", "")
     state.setdefault("error", "")
+    state.setdefault("resume_from_node", "")
     return state
 
 
@@ -53,6 +55,7 @@ def state_snapshot(state: AgentState) -> dict[str, Any]:
         "job_id": state.get("job_id"),
         "platform": state.get("platform"),
         "user_requirement": state.get("user_requirement"),
+        "image_paths": state.get("image_paths", []),
         "image_count": len(state.get("image_paths", [])),
         "retry_count": state.get("retry_count"),
         "max_retries": state.get("max_retries"),

@@ -31,6 +31,14 @@ class JobStateResponse(BaseModel):
     job_id: str
     status: str
     state: dict[str, Any]
+    failed_node: str = ""
+
+
+class JobResumeResponse(BaseModel):
+    job_id: str
+    original_job_id: str
+    resumed_from_node: str
+    status: str = "accepted"
 
 
 class JobEventsResponse(BaseModel):

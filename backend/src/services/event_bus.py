@@ -12,6 +12,7 @@ class JobRuntime:
     events: list[dict[str, Any]] = field(default_factory=list)
     status: str = "running"
     final_state: dict[str, Any] = field(default_factory=dict)
+    failed_node: str = ""
 
 
 class EventBus:
@@ -67,8 +68,21 @@ class EventBus:
         self._jobs[job_id].status = "completed"
         self._jobs[job_id].final_state = dict(final_state)
 
-    async def mark_failed(self, job_id: str, final_state: dict[str, Any]) -> None:
+    def get_failed_node(self, job_id: str) -> str:
+        """Extract the last NODE_START node name from events as the failed node."""
+        if job_id not in self._jobs:
+            return ""
+        runtime = self._jobs[job_id]
+        if runtime.failed_node:
+            return runtime.failed_node
+        for event in reversed(runtime.events):
+            if event.get("type") == "NODE_START":
+                return event.get("data", {}).get("node", "")
+        return ""
+
+    async def mark_failed(self, job_id: str, final_state: dict[str, Any], failed_node: str = "") -> None:
         if job_id not in self._jobs:
             return
         self._jobs[job_id].status = "failed"
         self._jobs[job_id].final_state = dict(final_state)
+        self._jobs[job_id].failed_node = failed_node or self.get_failed_node(job_id)

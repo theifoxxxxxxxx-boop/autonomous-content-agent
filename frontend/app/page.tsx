@@ -23,6 +23,8 @@ export default function HomePage() {
   const [draftContent, setDraftContent] = useState("");
   const [statusText, setStatusText] = useState("等待任务开始");
   const [jobFinalStatus, setJobFinalStatus] = useState("");
+  const [failedNode, setFailedNode] = useState("");
+  const [isResuming, setIsResuming] = useState(false);
   const [browserState, setBrowserState] = useState<BrowserReadyState>({
     status: "idle",
     liveUrl: "",
@@ -84,11 +86,17 @@ export default function HomePage() {
           });
         }
 
+        if (payload.type === "JOB_FAILED") {
+          const node = data["failed_node"];
+          if (typeof node === "string" && node) setFailedNode(node);
+        }
+
         if (payload.type === "JOB_COMPLETED" || payload.type === "JOB_FAILED") {
           void fetch(`${BACKEND_URL}/api/jobs/${createdJobId}`)
             .then((res) => res.json())
-            .then((result: { status?: string }) => {
+            .then((result: { status?: string; failed_node?: string }) => {
               setJobFinalStatus(result.status ?? "");
+              if (result.failed_node) setFailedNode(result.failed_node);
             })
             .catch(() => {
               setJobFinalStatus("");
@@ -125,6 +133,7 @@ export default function HomePage() {
     setBrowserState({ status: "idle", liveUrl: "", instructions: "" });
     setStatusText("正在创建任务...");
     setJobFinalStatus("");
+    setFailedNode("");
 
     try {
       const form = new FormData();
@@ -149,6 +158,42 @@ export default function HomePage() {
       setStatusText(error instanceof Error ? error.message : "请求失败");
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  const NODE_LABELS: Record<string, string> = {
+    A: "视觉分析 (Node A)",
+    B: "文案生成 (Node B)",
+    C: "审核校验 (Node C)",
+    D: "浏览器自动化 (Node D)",
+    E: "通知 (Node E)",
+  };
+
+  const onResume = async () => {
+    if (!jobId) return;
+    setIsResuming(true);
+    setLogs([]);
+    setBrowserState({ status: "idle", liveUrl: "", instructions: "" });
+    setStatusText("正在从失败节点恢复执行...");
+    setJobFinalStatus("");
+
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/jobs/${jobId}/resume`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "恢复执行失败");
+      }
+      const data = (await response.json()) as { job_id: string; resumed_from_node: string };
+      setJobId(data.job_id);
+      setFailedNode("");
+      setStatusText(`从节点 ${data.resumed_from_node} 恢复执行，新任务: ${data.job_id}`);
+      connectSse(data.job_id);
+    } catch (error) {
+      setStatusText(error instanceof Error ? error.message : "恢复执行失败");
+    } finally {
+      setIsResuming(false);
     }
   };
 
@@ -206,6 +251,24 @@ export default function HomePage() {
             </p>
           ) : null}
           {jobFinalStatus ? <p className="hint">最终状态：{jobFinalStatus}</p> : null}
+          {jobFinalStatus === "failed" && failedNode && (
+            <div style={{ marginTop: 12, padding: "10px 14px", background: "#fff3f3", borderRadius: 8, border: "1px solid #ffccc7" }}>
+              <p style={{ margin: 0, color: "#cf1322", fontWeight: 600 }}>
+                失败节点：{NODE_LABELS[failedNode] ?? failedNode}
+              </p>
+              <p style={{ margin: "6px 0 10px", color: "#595959", fontSize: 13 }}>
+                可从失败节点恢复执行，跳过已成功的节点，节省时间和 Token。
+              </p>
+              <button
+                className="btn btn-primary"
+                onClick={onResume}
+                disabled={isResuming}
+                style={{ fontSize: 14 }}
+              >
+                {isResuming ? "恢复中..." : `从节点 ${failedNode} 重试`}
+              </button>
+            </div>
+          )}
         </section>
 
         <section className="card">

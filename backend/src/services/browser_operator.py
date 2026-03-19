@@ -408,7 +408,9 @@ class BrowserOperator:
                 step_name="switching to image publish mode",
             )
             if adapter.name.lower() == "xhs":
-                title_filled, content_filled = await self._fill_xhs_title_and_content_fast(page, title, content)
+                title_filled, content_filled = await self._fill_xhs_title_and_content_resilient(
+                    page, title, content
+                )
             else:
                 title_filled = await self._fill_text(page, adapter.title_selectors, title)
                 content_filled = await self._fill_text(page, adapter.content_selectors, content)
@@ -448,7 +450,10 @@ class BrowserOperator:
                 )
 
             if adapter.name.lower() == "xhs":
-                retry_title_filled, retry_content_filled = await self._fill_xhs_title_and_content_fast(page, title, content)
+                await page.wait_for_timeout(2_500)
+                retry_title_filled, retry_content_filled = await self._fill_xhs_title_and_content_resilient(
+                    page, title, content
+                )
                 title_filled = title_filled or retry_title_filled
                 content_filled = content_filled or retry_content_filled
 
@@ -458,10 +463,20 @@ class BrowserOperator:
                     missing_parts.append("title")
                 if not content_filled:
                     missing_parts.append("content")
+                keep_session_open = self._keep_session_for_manual_takeover(
+                    keep_session_open=keep_session_open,
+                    playwright=playwright,
+                    context=context,
+                    launched_browser=launched_browser,
+                )
                 return BrowserOperationResult(
-                    status="failed",
+                    status="ready",
                     live_url="",
-                    note=f"Failed to fill editor fields: {', '.join(missing_parts)}.",
+                    note=(
+                        "Browser is open for manual takeover. "
+                        f"Auto-fill missed: {', '.join(missing_parts)}. "
+                        "Please fill them manually and publish yourself."
+                    ),
                 )
 
             publish_button_found = await self._await_with_timeout(
@@ -480,18 +495,18 @@ class BrowserOperator:
                     note="Publish button not found, cannot confirm pre-publish state.",
                 )
 
-            if adapter.name.lower() == "xhs":
-                await page.wait_for_timeout(600_000)
-
             note = (
                 "Browser is ready. Title/content/images are filled and flow is paused before publish. "
                 "Please verify manually and click publish yourself."
             )
             if launch_recovery_note:
                 note = f"{note} {launch_recovery_note}"
-            keep_session_open = self.settings.browser_keep_alive
-            if keep_session_open and context is not None and playwright is not None:
-                self._live_sessions.append((playwright, context, launched_browser))
+            keep_session_open = self._keep_session_for_manual_takeover(
+                keep_session_open=keep_session_open,
+                playwright=playwright,
+                context=context,
+                launched_browser=launched_browser,
+            )
             return BrowserOperationResult(status="ready", live_url="", note=note)
         except PlaywrightTimeoutError:
             return BrowserOperationResult(status="failed", live_url="", note="Browser operation timed out.")
@@ -697,6 +712,20 @@ class BrowserOperator:
             with contextlib.suppress(Exception):
                 await playwright.stop()
         await asyncio.sleep(1)
+
+    def _keep_session_for_manual_takeover(
+        self,
+        keep_session_open: bool,
+        playwright: Any | None,
+        context: BrowserContext | None,
+        launched_browser: Any | None,
+    ) -> bool:
+        if keep_session_open or not self.settings.browser_keep_alive:
+            return keep_session_open
+        if context is not None and playwright is not None:
+            self._live_sessions.append((playwright, context, launched_browser))
+            return True
+        return keep_session_open
 
     def _summarize_exception(self, exc: Exception) -> str:
         text = " ".join(str(exc).splitlines())
@@ -991,6 +1020,122 @@ class BrowserOperator:
                     break
 
         return title_filled, content_filled
+
+    async def _fill_xhs_title_and_content_resilient(
+        self, page: Page, title: str, content: str
+    ) -> tuple[bool, bool]:
+        title_value = title.strip()
+        content_value = content.strip()
+        title_filled = False
+        content_filled = False
+
+        if title_value:
+            title_filled = await self._fill_xhs_title(page, title_value)
+
+        if content_value:
+            content_filled = await self._fill_xhs_content(page, content_value)
+
+        return title_filled, content_filled
+
+    async def _fill_xhs_title(self, page: Page, title_value: str) -> bool:
+        title_selectors = [
+            "input[placeholder*='\u586b\u5199\u6807\u9898']",
+            "input[placeholder*='\u6dfb\u52a0\u6807\u9898']",
+            "input[placeholder*='\u6807\u9898']",
+            "textarea[placeholder*='\u6807\u9898']",
+            "[contenteditable='true'][data-placeholder*='\u6807\u9898']",
+            "[role='textbox'][data-placeholder*='\u6807\u9898']",
+            "input.c-input_inner",
+            "input[type='text']",
+        ]
+        for selector in title_selectors:
+            with contextlib.suppress(Exception):
+                locator = page.locator(selector)
+                count = await locator.count()
+                for idx in range(count):
+                    target = locator.nth(idx)
+                    if not await target.is_visible():
+                        continue
+                    if await self._fill_text_target(page, target, title_value):
+                        return True
+        return False
+
+    async def _fill_xhs_content(self, page: Page, content_value: str) -> bool:
+        content_selectors = [
+            "div.ql-editor",
+            "div[contenteditable='true'][data-placeholder*='\u8f93\u5165\u6b63\u6587']",
+            "div[contenteditable='true'][data-placeholder*='\u8f93\u5165\u6b63\u6587\u63cf\u8ff0']",
+            "div[contenteditable='true'][data-placeholder*='\u6b63\u6587']",
+            "textarea[placeholder*='\u8f93\u5165\u6b63\u6587']",
+            "textarea[placeholder*='\u8f93\u5165\u6b63\u6587\u63cf\u8ff0']",
+            "textarea[placeholder*='\u6b63\u6587']",
+            "textarea[placeholder*='\u5185\u5bb9']",
+            "[role='textbox'][data-placeholder*='\u6b63\u6587']",
+            "div[contenteditable='true']",
+        ]
+        for selector in content_selectors:
+            with contextlib.suppress(Exception):
+                locator = page.locator(selector)
+                count = await locator.count()
+                for idx in range(count):
+                    target = locator.nth(idx)
+                    if not await target.is_visible():
+                        continue
+                    if await self._fill_text_target(page, target, content_value):
+                        return True
+        return False
+
+    async def _fill_text_target(self, page: Page, target: Any, value: str) -> bool:
+        with contextlib.suppress(Exception):
+            await target.scroll_into_view_if_needed(timeout=5_000)
+        with contextlib.suppress(Exception):
+            await target.click(timeout=10_000)
+
+        with contextlib.suppress(Exception):
+            await target.fill(value, timeout=10_000)
+            if await self._target_contains_value(target, value):
+                return True
+
+        with contextlib.suppress(Exception):
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+        with contextlib.suppress(Exception):
+            await page.keyboard.insert_text(value)
+            if await self._target_contains_value(target, value):
+                return True
+
+        with contextlib.suppress(Exception):
+            await target.evaluate(
+                """(el, text) => {
+                    if ('value' in el) {
+                        el.value = text;
+                    } else {
+                        el.innerHTML = '';
+                        el.textContent = text;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                }""",
+                value,
+            )
+            if await self._target_contains_value(target, value):
+                return True
+
+        return False
+
+    async def _target_contains_value(self, target: Any, value: str) -> bool:
+        current_text = await target.evaluate(
+            """(el) => {
+                if ('value' in el) return el.value || '';
+                return el.innerText || el.textContent || '';
+            }"""
+        )
+        current_value = " ".join(str(current_text).split())
+        expected = " ".join(value.split())
+        if not expected:
+            return False
+        return expected[:10] in current_value or expected[:20] in current_value
 
     async def _fill_text(self, page: Page, selectors: list[str], content: str) -> bool:
         value = content.strip()

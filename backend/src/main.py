@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.config import get_settings
-from src.schemas import HealthResponse, JobCreateResponse, JobEventsResponse, JobStateResponse, PlatformType
+from src.schemas import HealthResponse, JobCreateResponse, JobEventsResponse, JobResumeResponse, JobStateResponse, PlatformType
 from src.services.event_bus import EventBus
 from src.workflow.graph import WorkflowEngine
 from src.workflow.state import AgentState, state_snapshot
@@ -114,12 +114,17 @@ async def _execute_job(initial_state: AgentState) -> None:
     try:
         result_state = await workflow_engine.run(initial_state)
         if result_state.get("error"):
-            await event_bus.mark_failed(job_id, result_state)
+            failed_node = event_bus.get_failed_node(job_id)
+            await event_bus.mark_failed(job_id, result_state, failed_node=failed_node)
             await event_bus.publish(
                 job_id,
                 "JOB_FAILED",
                 "任务执行失败",
-                {"state": state_snapshot(result_state), "error": result_state.get("error")},
+                {
+                    "state": state_snapshot(result_state),
+                    "error": result_state.get("error"),
+                    "failed_node": failed_node,
+                },
             )
             return
 
@@ -135,12 +140,18 @@ async def _execute_job(initial_state: AgentState) -> None:
         failed_state = dict(initial_state)
         failed_state["error"] = str(exc)
         failed_state["traceback"] = trace
-        await event_bus.mark_failed(job_id, failed_state)
+        failed_node = event_bus.get_failed_node(job_id)
+        await event_bus.mark_failed(job_id, failed_state, failed_node=failed_node)
         await event_bus.publish(
             job_id,
             "JOB_FAILED",
             "任务执行异常",
-            {"state": state_snapshot(failed_state), "error": str(exc), "traceback": trace},
+            {
+                "state": state_snapshot(failed_state),
+                "error": str(exc),
+                "traceback": trace,
+                "failed_node": failed_node,
+            },
         )
 
 
@@ -182,7 +193,55 @@ async def get_job(job_id: str) -> JobStateResponse:
     if not event_bus.has_job(job_id):
         raise HTTPException(status_code=404, detail="job not found")
     state = event_bus.get_job_state(job_id)
-    return JobStateResponse(job_id=job_id, status=state["status"], state=state["state"])
+    failed_node = ""
+    if state["status"] == "failed":
+        failed_node = event_bus.get_failed_node(job_id)
+    return JobStateResponse(job_id=job_id, status=state["status"], state=state["state"], failed_node=failed_node)
+
+
+NODE_LABEL_TO_NAME = {"A": "node_a_vision", "B": "node_b_copy", "C": "node_c_review", "D": "node_d_browser", "E": "node_e_notify"}
+
+
+@app.post("/api/jobs/{job_id}/resume", response_model=JobResumeResponse)
+async def resume_job(job_id: str) -> JobResumeResponse:
+    """Resume a failed job from the failed node instead of restarting from scratch."""
+    if not event_bus.has_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+
+    job_info = event_bus.get_job_state(job_id)
+    if job_info["status"] != "failed":
+        raise HTTPException(status_code=400, detail="只有失败的任务才能恢复执行")
+
+    failed_node = event_bus.get_failed_node(job_id)
+    if not failed_node or failed_node not in NODE_LABEL_TO_NAME:
+        raise HTTPException(status_code=400, detail="无法确定失败节点，请重新创建任务")
+
+    # Build resumed state from the old final_state
+    old_state: dict = dict(job_info["state"])
+
+    # Create a new job_id so SSE / events are clean
+    new_job_id = uuid4().hex
+    old_state["job_id"] = new_job_id
+    old_state["error"] = ""
+    old_state["resume_from_node"] = failed_node
+
+    # Restore image_paths from original job events if missing in final_state snapshot
+    if not old_state.get("image_paths"):
+        for evt in event_bus.get_job_events(job_id):
+            paths = evt.get("data", {}).get("state", {}).get("image_paths")
+            if paths:
+                old_state["image_paths"] = paths
+                break
+
+    event_bus.create_job(new_job_id, old_state)
+    await event_bus.publish(
+        new_job_id,
+        "JOB_RESUMED",
+        f"从节点 {failed_node} 恢复执行（原任务 {job_id}）",
+        {"state": state_snapshot(old_state), "original_job_id": job_id, "resume_from_node": failed_node},
+    )
+    asyncio.create_task(_execute_job(old_state))
+    return JobResumeResponse(job_id=new_job_id, original_job_id=job_id, resumed_from_node=failed_node)
 
 
 @app.get("/api/jobs/{job_id}/events", response_model=JobEventsResponse)

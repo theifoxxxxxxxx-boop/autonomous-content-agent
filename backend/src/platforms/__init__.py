@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .base import PlatformAdapter
 from .douyin import DouyinAdapter
-from .xhs import XhsAdapter
+from .xhs_fixed import XhsAdapter
 
 
 def get_platform_adapter(platform: str) -> PlatformAdapter:
